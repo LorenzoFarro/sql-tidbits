@@ -1,0 +1,476 @@
+DROP TABLE IF EXISTS #data
+DROP TABLE IF EXISTS #dataTotal
+DROP TABLE IF EXISTS #dataUpperBound
+DROP TABLE IF EXISTS #fifoResult
+DROP TABLE IF EXISTS #fifoResultActual
+DROP TABLE IF EXISTS #fifoResultExpected
+DROP TABLE IF EXISTS #dataConsumption
+DROP TABLE IF EXISTS #dataConsumptionActual
+DROP TABLE IF EXISTS #dataConsumptionExpected
+
+GO
+
+/*
+	Assumptions
+	---------------------
+	assume XID is the transaction ID as well as the order of the transactions
+	Total outputs do not exceed total inputs....for now :)
+*/
+
+CREATE TABLE #data 
+(
+	Node int, --is the node when woking with locations
+	XID int, 
+	Amt decimal (10,2), 
+	Direction int, 
+	IsInput	AS CASE WHEN Direction = 1 THEN 1 ELSE 0 END,
+	IsOutput AS CASE WHEN Direction = -1 THEN 1 ELSE 0 END,
+	Description varchar(MAX)
+)
+INSERT INTO #data (Node,XID,Amt,Direction,Description) VALUES
+--scenario 1
+(1,1,100,1,''),
+(1,2,100,1,''),
+(1,3,100,1,''),
+(1,4,150,-1,'Draw more than input 1'),
+(1,5,25,-1,'Draw less than would exceed 2'),
+(1,6,50,-1,'Draw and exceed input 2'),
+--scenario 2
+(2,1,100,1,''),
+(2,2,100,1,''),
+(2,3,100,1,''),
+(2,4,100,-1,'Draw equal to input 1'),
+(2,5,50,-1,'Draw less than would exceed 2'),
+(2,6,50,-1,'Draw equal to input 2'),
+--scenario 3
+(3,1,100,1,''),
+(3,2,100,1,''),
+(3,3,100,1,''),
+(3,4,50,-1,'Draw less than input 1'),
+(3,5,25,-1,'Draw less than input 1'),
+(3,6,125,-1,'Draw equal to input 2'),
+--scenario 4
+(4,1,100,1,''),
+(4,2,100,1,''),
+(4,3,100,1,''),
+(4,4,50,-1,'Draw less than input 1'),
+(4,5,200,-1,'Draw multiple inputs so there is a gap between lower and upper bound'),
+(4,6,10,-1,'Draw just a bit from input 3')
+
+SELECT
+x.*
+,x.TotalInput - x.TotalOutput AS TotalBalance
+,CASE WHEN x.TotalOutput > x.TotalInput THEN 1 ELSE 0 END AS IsNegBalance
+INTO #dataTotal
+FROM (
+	SELECT
+	x.Node
+	,x.XID
+	,CASE WHEN x.Direction = 1 THEN SUM(x.IsInput) OVER (PARTITION BY x.Node ORDER BY x.XID) END AS InputID
+	,CASE WHEN x.Direction = -1 THEN SUM(x.IsOutput) OVER (PARTITION BY x.Node ORDER BY x.XID) END AS OutputID
+	,x.Amt
+	,x.Direction
+	,SUM(CASE WHEN x.Direction = 1 THEN x.Amt ELSE 0 END) OVER (PARTITION BY x.Node ORDER BY x.XID) AS TotalInput
+	,SUM(CASE WHEN x.Direction = -1 THEN x.Amt ELSE 0 END) OVER (PARTITION BY x.Node ORDER BY x.XID) AS TotalOutput
+	,Description
+	FROM #data x
+) AS x
+
+IF(1=2)
+BEGIN
+	SELECT '#dataTotal' AS #dataTotal, * FROM #dataTotal
+END
+
+SELECT
+rdt.*
+,upperBound.UpperBound
+,upperBoundTotalRemaining.UpperBoundTotalRemaining
+INTO #dataUpperBound
+FROM #dataTotal rdt
+OUTER APPLY
+(
+	--get the closest id representing the total input that this much output has consumed but not exceeded
+	SELECT
+	MIN(ub.XID) AS UpperBound
+	FROM #dataTotal ub
+	--matching scenarios
+	WHERE ub.Node = rdt.Node
+	--this bound represents one of the inputs
+	AND ub.Direction = 1
+	--this record is the output
+	AND rdt.Direction = -1
+	--this bound must have happened prior to this record
+	AND ub.XID < rdt.XID
+	--the total input for this record exceeds the total output
+	AND ub.TotalInput >= rdt.TotalOutput
+) AS upperBound
+OUTER APPLY
+(
+	--once finding the closest amount that represents what has been consumed
+	--then I want to know how much of the total input has been consumed up to this amount of input
+	--if the value is exactly 0 then I know the next output (in the next query will need to start at the next input and not this one)
+	SELECT
+	ubt.TotalInput - rdt.TotalOutput AS UpperBoundTotalRemaining
+	FROM #dataTotal ubt
+	WHERE ubt.Node = rdt.Node
+	AND ubt.XID = upperBound.UpperBound
+) AS upperBoundTotalRemaining
+
+IF(1=2)
+BEGIN
+	SELECT '#dataUpperBound' AS #dataUpperBound, * FROM #dataUpperBound
+	RETURN
+END 
+
+SELECT
+rdt.Node
+,rdt.XID
+,rdt.Amt
+,rdt.Direction
+,rdt.TotalInput
+,rdt.TotalOutput
+,priorOutput.PriorOutputXID
+,priorUpperBound.PriorUpperBound AS PriorUpperBound
+,priorUpperBound.PriorUpperBoundTotalRemaining AS PriorUpperBoundTotalRemaining
+,lowerBoundFirstOuput.LowerBoundFirstOuput
+,lowerBoundNotFirstOuput.LowerBoundNotFirstOuput
+,lowerBound.LowerBound
+,rdt.UpperBound
+,rdt.UpperBoundTotalRemaining
+,rdt.Description
+INTO #fifoResult
+FROM #dataUpperBound rdt
+OUTER APPLY
+(	
+	SELECT
+	fi.TotalInput
+	FROM #dataUpperBound fi
+	WHERE fi.Node = rdt.Node
+	AND fi.InputID = 1
+) AS firstInput
+OUTER APPLY
+(
+	--this is the input that has the upper bound that I'm interested in seeing
+	SELECT
+	MAX(mpi.XID) AS PriorOutputXID
+	FROM #dataUpperBound mpi
+	--matching Nodes
+	WHERE mpi.Node = rdt.Node
+	--only need it when this record is also an output
+	AND mpi.Direction = -1
+	--this ID must be prior to the current record
+	AND mpi.XID < rdt.XID
+) AS priorOutput
+OUTER APPLY
+(
+	--get the latest upper bound prior to this record
+	--because I know that we've consumed the amt up to this bound
+	--so the current lower bound must be greater than or equal to that upper bound
+	SELECT
+	pub.UpperBound AS PriorUpperBound
+	,pub.UpperBoundTotalRemaining AS PriorUpperBoundTotalRemaining
+	FROM #dataUpperBound pub
+	--matching Nodes
+	WHERE pub.Node = rdt.Node
+	--get the upper bounds that was set on an output
+	AND pub.Direction = -1
+	--only need it when this record is also an output
+	AND rdt.Direction = -1
+	--this ID must be prior to the current record
+	AND pub.XID = priorOutput.PriorOutputXID
+) AS priorUpperBound
+OUTER APPLY
+(
+	SELECT
+	COALESCE(lb.LowerBound,1) AS LowerBoundFirstOuput
+	FROM (
+		SELECT
+		MAX(lb.XID) AS LowerBound
+		FROM #dataTotal lb
+		--Nodes match
+		WHERE lb.Node = rdt.Node
+		--we are looking at inputs
+		AND lb.Direction = 1
+		--the main records is an output
+		AND rdt.Direction = -1
+		--this lowerbound  must be a record less than the current record
+		AND lb.XID < rdt.XID
+		--first output
+		--AND rdt.OutputID = 1
+
+		--the total input must be <= because we know this has been consumed
+		--case where the first input is less than or equal to the first output
+		--if this is not the case (for example 1st input is 10 and first output is 5)
+		--then this record will be null and I know to coalesce to the first input
+		AND lb.TotalInput <= rdt.TotalOutput
+	) AS lb
+	--first output
+	WHERE rdt.OutputID = 1
+) AS lowerBoundFirstOuput
+OUTER APPLY
+(
+	SELECT
+	CASE WHEN COALESCE(rdt.OutputID,-1) > 1 
+		THEN CASE
+		--subcase 1 - there is some left to consume at this input
+		WHEN priorUpperBound.PriorUpperBoundTotalRemaining > 0 THEN priorUpperBound.PriorUpperBound
+		--subcase 2 - there is no more left at the prior input so we use the next on
+		WHEN priorUpperBound.PriorUpperBoundTotalRemaining = 0 THEN priorUpperBound.PriorUpperBound + 1
+		--TODO - handle case of overdrawing? that is not part of this assumption, but for real life cases it shoudl be addressed
+		END
+	END AS LowerBoundNotFirstOuput
+) AS lowerBoundNotFirstOuput
+OUTER APPLY
+(
+	SELECT COALESCE(lowerBoundFirstOuput.LowerBoundFirstOuput,lowerBoundNotFirstOuput.LowerBoundNotFirstOuput) AS LowerBound
+) AS lowerBound
+
+IF(1=1)
+BEGIN
+	SELECT '#fifoResult' AS #fifoResult, * FROM #fifoResult ORDER BY Node, XID
+END
+
+IF(1=1)
+BEGIN
+
+	CREATE TABLE #fifoResultActual (Node int, XID int, Amt decimal(10,2), Direction int, TotalInput decimal(10,2), TotalOutput decimal(10,2), LowerBound int, UpperBound int, Description varchar(MAX))
+	CREATE TABLE #fifoResultExpected (Node int, XID int, Amt decimal(10,2), Direction int, TotalInput decimal(10,2), TotalOutput decimal(10,2), LowerBound int, UpperBound int)
+
+	INSERT INTO #fifoResultExpected
+	(
+		Node
+		,XID
+		,Amt
+		,Direction
+		,TotalInput
+		,TotalOutput
+		,LowerBound
+		,UpperBound
+	) VALUES
+	(1,1,100,1,100,0,NULL,NULL),
+	(1,2,100,1,200,0,NULL,NULL),
+	(1,3,100,1,300,0,NULL,NULL),
+	(1,4,150,-1,300,150,1,2),
+	(1,5,25,-1,300,175,2,2),
+	(1,6,50,-1,300,225,2,3),
+
+	(2,1,100,1,100,0,NULL,NULL),
+	(2,2,100,1,200,0,NULL,NULL),
+	(2,3,100,1,300,0,NULL,NULL),
+	(2,4,100,-1,300,100,1,1),
+	(2,5,50,-1,300,150,2,2),
+	(2,6,50,-1,300,200,2,2),
+
+	(3,1,100,1,100,00,NULL,NULL),
+	(3,2,100,1,200,00,NULL,NULL),
+	(3,3,100,1,300,00,NULL,NULL),
+	(3,4,50,-1,300,50,1,1),
+	(3,5,25,-1,300,75,1,1),
+	(3,6,125,-1,300,200,1,2),
+
+	(4,1,100,1,100,00,NULL,NULL),
+	(4,2,100,1,200,00,NULL,NULL),
+	(4,3,100,1,300,00,NULL,NULL),
+	(4,4,50,-1,300,50,1,1),
+	(4,5,200,-1,300,250,1,3),
+	(4,6,10,-1,300,260,3,3)
+
+	INSERT INTO #fifoResultActual
+	(
+		Node
+		,XID
+		,Amt
+		,Direction
+		,TotalInput
+		,TotalOutput
+		,LowerBound
+		,UpperBound
+		,Description
+	)
+	(
+		SELECT
+		Node
+		,XID
+		,Amt
+		,Direction
+		,TotalInput
+		,TotalOutput
+		,LowerBound
+		,UpperBound
+		,Description
+		FROM #fifoResult
+	)
+
+	--test
+	SELECT
+	'TestResult' AS TestResult
+	,Node
+	,XID
+	,Amt
+	,Direction
+	,TotalInput
+	,TotalOutput
+	,LowerBound
+	,UpperBound
+	,SUM(Actual) AS Actual
+	,SUM(Expected) AS Expected
+	FROM (
+		SELECT
+		Node
+		,XID
+		,Amt
+		,Direction
+		,TotalInput
+		,TotalOutput
+		,LowerBound
+		,UpperBound
+		,1 AS Actual
+		,0 AS Expected
+		FROM #fifoResult
+
+		UNION ALL
+
+		SELECT
+		Node
+		,XID
+		,Amt
+		,Direction
+		,TotalInput
+		,TotalOutput
+		,LowerBound
+		,UpperBound
+		,0 AS Actual
+		,1 AS Expected
+		FROM #fifoResultExpected
+	) AS tbl
+	GROUP BY 
+	Node
+	,XID
+	,Amt
+	,Direction
+	,TotalInput
+	,TotalOutput
+	,LowerBound
+	,UpperBound
+	HAVING SUM(Actual) != SUM(Expected)
+	ORDER BY 
+	Node
+	,XID
+	,SUM(Actual)		--should show Expected first
+END
+
+DROP TABLE IF EXISTS #dataConsumption
+
+--build allocation list
+SELECT 
+ops.Node
+,ops.XID AS OutputXID
+,ips.InputXID
+,ips.ConsumedAmt
+--,ips.Count
+INTO #dataConsumption
+FROM #fifoResult ops
+OUTER APPLY
+(
+	SELECT
+	--COUNT(*) AS Count
+	ips.XID AS InputXID
+	,CASE 
+		--if only some or all of a single input was consumed, then the consumed amount was the size of the output
+		WHEN ops.LowerBound = ops.UpperBound THEN ops.Amt
+		ELSE
+		--otherwise the input consumed the remaining amount of the lower bound
+		--some or all of the upper bound, all all inputs in between
+		CASE 
+		--coalesce prior remaining because if it's first output, this will be null, in which case all of the lower bound input was consumed
+		WHEN ips.XID = ops.LowerBound THEN COALESCE(ops.PriorUpperBoundTotalRemaining,ips.Amt)
+		WHEN ips.XID = ops.UpperBound THEN ips.Amt - ops.UpperBoundTotalRemaining
+		--case for all inputs consumed in between
+		ELSE ips.Amt
+		END
+	END AS ConsumedAmt
+	FROM #fifoResult ips
+	WHERE ips.Node = ops.Node
+	AND ips.Direction = 1
+	AND ips.XID BETWEEN ops.LowerBound AND ops.UpperBound
+) AS ips
+WHERE ops.Direction = -1
+
+IF(1=1)
+BEGIN
+	SELECT '#dataConsumption' AS #dataConsumption, * FROM #dataConsumption ORDER BY Node,OutputXID--,InputXID
+END
+
+IF(1=1)
+BEGIN
+	
+	CREATE TABLE #dataConsumptionActual (Node int, OutputXID int, InputXID int, ConsumedAmt decimal(10,2))
+	CREATE TABLE #dataConsumptionExpected (Node int, OutputXID int, InputXID int, ConsumedAmt decimal(10,2))
+
+	INSERT INTO #dataConsumptionExpected (Node,OutputXID,InputXID,ConsumedAmt) VALUES
+	(1,4,1,100),
+	(1,4,2,50),
+	(1,5,2,25),
+	(1,6,2,25),
+	(1,6,3,25),
+	(2,4,1,100),
+	(2,5,2,50),
+	(2,6,2,50),
+	(3,4,1,50),
+	(3,5,1,25),
+	(3,6,1,25),
+	(3,6,2,100),
+	(4,4,1,50),
+	(4,5,1,50),
+	(4,5,2,100),
+	(4,5,3,50),
+	(4,6,3,10)
+
+	INSERT INTO #dataConsumptionActual (Node,OutputXID,InputXID,ConsumedAmt)
+	(
+		SELECT
+		Node
+		,OutputXID
+		,InputXID
+		,ConsumedAmt
+		FROM #dataConsumption
+	)
+
+	SELECT
+	'ConsumptionTestResult' AS ConsumptionTestResult
+	,Node
+	,OutputXID
+	,InputXID
+	,ConsumedAmt
+	,SUM(Actual)	AS Actual
+	,SUM(Expected)	AS Expected
+	FROM 
+	(
+		SELECT
+		Node
+		,OutputXID
+		,InputXID
+		,ConsumedAmt
+		,1 AS Actual
+		,0 AS Expected
+		FROM #dataConsumptionActual
+		
+		UNION ALL
+
+		SELECT
+		Node
+		,OutputXID
+		,InputXID
+		,ConsumedAmt
+		,0 AS Actual
+		,1 AS Expected
+		FROM #dataConsumptionExpected
+	) AS tbl
+	GROUP BY 
+	Node
+	,OutputXID
+	,InputXID
+	,ConsumedAmt
+	HAVING SUM(Actual) != SUM(Expected)
+	ORDER BY SUM(Actual)
+END
